@@ -11,7 +11,8 @@ ID_URL = 'https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_
 PLAYER_URL = 'https://api.sleeper.app/v1/players/nfl'
 METRICS = ['attempts','completions','passing_yards','passing_tds','passing_interceptions','carries','rushing_yards','rushing_tds','targets','receptions','receiving_yards','receiving_tds','receiving_air_yards','receiving_yards_after_catch','target_share','air_yards_share','fantasy_points','fantasy_points_ppr']
 SORTS = ['targets','carries','opportunities','receiving_air_yards','target_share','offense_snaps','offense_pct']
-POSITIONS = {'QB','RB','WR','TE','FB'}
+POSITIONS = {'QB','RB','WR','TE','FB','HB'}
+EXTERNAL_IDS = ('gsis_id','rotowire_id','espn_id','sportradar_id')
 COLS = ['name','position','week','game_id','team','opponent','gsis_id','pfr_id','sleeper_id','stats_present','snaps_present',*METRICS,'opportunities','offense_snaps','offense_pct']
 
 def stamp(): return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00','Z')
@@ -46,19 +47,41 @@ def csv_rows(text, required):
 def crosswalk(text):
     rows=[]
     for r in csv_rows(text,['sleeper_id','gsis_id','pfr_id','name','position']):
-        if r['position'] in POSITIONS:
-            rows.append({k:r.get(k) for k in ['name','position','sleeper_id','gsis_id','pfr_id']})
-    if not rows: raise ValueError('Empty offensive player crosswalk')
+        # Identity matching must not depend on a provider's potentially stale position.
+        if any(r.get(k) for k in ('sleeper_id','gsis_id','pfr_id')):
+            rows.append({k:r.get(k) for k in ['name','position','sleeper_id','gsis_id','pfr_id',*EXTERNAL_IDS]})
+    if not rows: raise ValueError('Empty player crosswalk')
     return rows
+
+def enrich_sleeper_ids(players, external_index):
+    added=0;ambiguous=0
+    claimed={p['sleeper_id'] for p in players if p.get('sleeper_id')}
+    source_counts={}
+    for p in players:
+        for field in EXTERNAL_IDS:
+            if p.get(field):
+                key=field+':'+str(p[field]);source_counts[key]=source_counts.get(key,0)+1
+    for p in players:
+        if p.get('sleeper_id'): continue
+        keys=[field+':'+str(p[field]) for field in EXTERNAL_IDS if p.get(field)]
+        matched=[key for key in keys if external_index.get(key)]
+        candidates={pid for key in matched for pid in external_index[key]}
+        if not candidates:continue
+        if len(candidates)!=1 or candidates&claimed or any(source_counts[key]!=1 or len(external_index[key])!=1 for key in matched):
+            ambiguous+=1;continue
+        p['sleeper_id']=next(iter(candidates));claimed.add(p['sleeper_id']);p['mapping_notes']=['Sleeper ID resolved through unique shared '+key.split(':',1)[0] for key in matched];added+=1
+    return {'sleeper_ids_added':added,'ambiguous_candidates_not_joined':ambiguous,'basis':'Unique shared provider IDs only; no name-only joining.'}
 
 def identities(players):
     shards=[{} for _ in range(128)]
     for p in players:
+        identity={k:p.get(k) for k in ['name','position','sleeper_id','gsis_id','pfr_id']}
+        if p.get('mapping_notes'):identity['mapping_notes']=p['mapping_notes']
         for prefix,field in [('s','sleeper_id'),('g','gsis_id'),('p','pfr_id'),('n','name')]:
             value=norm(p[field]) if prefix=='n' else p.get(field)
             if value:
                 key=prefix+':'+value
-                shards[bucket(key)].setdefault(key,[]).append(p)
+                shards[bucket(key)].setdefault(key,[]).append(identity)
     return [{'schema':1,'keys':s} for s in shards]
 
 def parse_stats(text, season):
@@ -67,7 +90,7 @@ def parse_stats(text, season):
         if r['season_type']!='REG' or number(r['season'])!=season or r['position'] not in POSITIONS: continue
         week=number(r['week'])
         if not isinstance(week,int) or not 1<=week<=18 or not r['player_id'] or not r['game_id']: raise ValueError('Invalid stats identity/week')
-        x={'gsis_id':r['player_id'],'name':r['player_display_name'],'position':'RB' if r['position']=='FB' else r['position'],'week':week,'game_id':r['game_id'],'team':r['team'],'opponent':r.get('opponent_team')}
+        x={'gsis_id':r['player_id'],'name':r['player_display_name'],'position':'RB' if r['position'] in ('FB','HB') else r['position'],'week':week,'game_id':r['game_id'],'team':r['team'],'opponent':r.get('opponent_team')}
         x.update({k:number(r[k]) for k in METRICS})
         x['opportunities']=None if x['carries'] is None or x['targets'] is None else x['carries']+x['targets']
         out.append(x)
@@ -81,7 +104,7 @@ def parse_snaps(text, season):
         week=number(r['week']); pct=number(r['offense_pct'])
         if not isinstance(week,int) or not 1<=week<=18 or not r['pfr_player_id'] or not r['game_id']: raise ValueError('Invalid snap identity/week')
         if pct is not None and not 0<=pct<=1: raise ValueError('Invalid snap percentage scale')
-        out.append({'pfr_id':r['pfr_player_id'],'name':r['player'],'position':'RB' if r['position']=='FB' else r['position'],'week':week,'game_id':r['game_id'],'team':r['team'],'opponent':r.get('opponent'),'offense_snaps':number(r['offense_snaps']),'offense_pct':pct})
+        out.append({'pfr_id':r['pfr_player_id'],'name':r['player'],'position':'RB' if r['position'] in ('FB','HB') else r['position'],'week':week,'game_id':r['game_id'],'team':r['team'],'opponent':r.get('opponent'),'offense_snaps':number(r['offense_snaps']),'offense_pct':pct})
     if not out: raise ValueError('Source has no usable snap records')
     return out
 
@@ -122,14 +145,16 @@ def week_file(rows, season, week, stats, snaps):
 
 def sleeper_catalog(raw, retrieved):
     if not isinstance(raw,dict) or not raw: raise ValueError('Invalid Sleeper directory')
-    players={}; names={}
+    players={}; names={};external_index={}
     for pid,p in raw.items():
         if not isinstance(p,dict): raise ValueError('Invalid player directory entry')
         name=p.get('full_name') or ' '.join(filter(None,[p.get('first_name'),p.get('last_name')])) or None
         players[pid]={'id':pid,'name':name,'position':p.get('position'),'fantasy_positions':p.get('fantasy_positions') or ([p['position']] if p.get('position') else []),'team':p.get('team'),'active':p.get('active'),'status':p.get('status'),**{k:number(p.get(k)) for k in ('search_rank','age','years_exp')}}
         if norm(name): names.setdefault(norm(name),[]).append(pid)
+        for field in EXTERNAL_IDS:
+            if clean(p.get(field)) is not None:external_index.setdefault(field+':'+str(p[field]),[]).append(pid)
     ordered=sorted(players,key=lambda pid:(players[pid]['search_rank'] if players[pid]['search_rank'] is not None and players[pid]['search_rank']>0 else math.inf,pid))
-    return {'schema':1,'encoding':'player-tuples-v1','fetched_at':retrieved,'source_count':len(raw),'players':{pid:[p[k] for k in ['name','position','fantasy_positions','team','active','status','search_rank','age','years_exp']] for pid,p in players.items()},'name_index':names,'ordered_ids':ordered}
+    return {'schema':1,'encoding':'player-tuples-v1','fetched_at':retrieved,'source_count':len(raw),'players':{pid:[p[k] for k in ['name','position','fantasy_positions','team','active','status','search_rank','age','years_exp']] for pid,p in players.items()},'name_index':names,'ordered_ids':ordered,'external_index':external_index}
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',default=str(ROOT/'data'));ap.add_argument('--season',type=int);ap.add_argument('--fixtures',type=Path);args=ap.parse_args()
@@ -147,7 +172,37 @@ def main():
         state,_=fetch('https://api.sleeper.app/v1/state/nfl');season=int(json.loads(state)['season'])
     if not 2025<=season<=datetime.now(timezone.utc).year: raise ValueError('Invalid current season')
     id_text,id_meta=get(ID_URL,'ids.csv');ids=crosswalk(id_text)
-    manifest={'schema':1,'generated_at':now,'current_season':season,'sources':{'ids':id_meta},'identities':[put(x) for x in identities(ids)],'seasons':{},'fixture_data':bool(args.fixtures)}
+    manifest={'schema':1,'generated_at':now,'current_season':season,'sources':{'ids':id_meta},'identities':[],'preparer_version':'1.3.1','seasons':{},'fixture_data':bool(args.fixtures)}
+    def put_catalog(c):
+        fields=['name','position','fantasy_positions','team','active','status','search_rank','age','years_exp']
+        tuples=c['players'] if c.get('encoding')=='player-tuples-v1' else {pid:[p.get(k) for k in fields] for pid,p in c['players'].items()}
+        teams=set('ARI ATL BAL BUF CAR CHI CIN CLE DAL DEN DET GB HOU IND JAX KC LV LAC LAR MIA MIN NE NO NYG NYJ PHI PIT SEA SF TB TEN WAS'.split())
+        positions=['QB','RB','WR','TE','K','DEF'];shards=[{} for _ in range(16)];core={};pool=[]
+        for pid in c['ordered_ids']:
+            r=tuples[pid];shards[bucket(pid)%16][pid]=r
+            mask=sum(1<<i for i,k in enumerate(positions) if k in (r[2] or []))
+            if mask:
+                assigned=r[3] in teams;pool.append([pid,mask,assigned,r[1]])
+                if assigned:core[pid]=r
+        return put({'schema':1,'encoding':'split-player-tuples-v1','fetched_at':c['fetched_at'],'source_count':c['source_count'],'core':core,'names':put({'schema':1,'index':c['name_index']}),'pool':put({'schema':1,'rows':pool}),'external_ids':put({'schema':1,'index':c['external_index']}),'shards':[put({'schema':1,'players':rows}) for rows in shards]})
+    old=previous.get('sleeper',{});old_age=math.inf
+    try: old_age=(datetime.now(timezone.utc)-datetime.fromisoformat(old['fetched_at'].replace('Z','+00:00'))).total_seconds()
+    except (KeyError,ValueError): pass
+    cached=None
+    if not args.fixtures and 0<=old_age<86400 and (dest/old['catalog']['path']).exists():cached=json.loads((dest/old['catalog']['path']).read_text())
+    if cached and cached.get('encoding')=='split-player-tuples-v1' and cached.get('external_ids') and (dest/cached['external_ids']['path']).exists():
+        manifest['sleeper']=old
+        files.extend([old['catalog']['path'],cached['names']['path'],cached['pool']['path'],cached['external_ids']['path'],*[x['path'] for x in cached['shards']]])
+    else:
+        raw,meta=get(PLAYER_URL,'sleeper.json');catalog=sleeper_catalog(json.loads(raw),meta['retrieved_at'])
+        if not args.fixtures and catalog['source_count']<1000: raise ValueError('Unexpectedly small player directory')
+        if old.get('source_count',0)>catalog['source_count']/0.75: raise ValueError('Player directory shrank by over 25%; refusing silent coverage loss')
+        manifest['sleeper']={'catalog':put_catalog(catalog),'fetched_at':meta['retrieved_at'],'source_count':catalog['source_count'],'url':PLAYER_URL}
+    catalog_meta=json.loads((dest/manifest['sleeper']['catalog']['path']).read_text())
+    external_index=json.loads((dest/catalog_meta['external_ids']['path']).read_text())['index']
+    manifest['identity_enrichment']=enrich_sleeper_ids(ids,external_index)
+    manifest['sources']['sleeper_identity_links']={'url':PLAYER_URL,'retrieved_at':manifest['sleeper']['fetched_at'],'file_modified_at':None,'status':'AVAILABLE'}
+    manifest['identities']=[put(x) for x in identities(ids)]
     # Prepare the current and previous season.
     for year in sorted({season,max(2025,season-1)}):
         values={};sources={};warnings=[]
@@ -162,33 +217,6 @@ def main():
         rows=join(ids,values['stats'],values['snaps'])
         manifest['seasons'][str(year)]={'status':'AVAILABLE','sources':sources,'warnings':warnings,'weeks':{str(w):put(week_file(rows,year,w,values['stats'],values['snaps'])) for w in range(1,19)}}
     if manifest['seasons'][str(season)]['status']!='AVAILABLE': raise ValueError('Current-season workload unavailable; previous publication retained')
-    def put_catalog(c):
-        fields=['name','position','fantasy_positions','team','active','status','search_rank','age','years_exp']
-        tuples=c['players'] if c.get('encoding')=='player-tuples-v1' else {pid:[p.get(k) for k in fields] for pid,p in c['players'].items()}
-        teams=set('ARI ATL BAL BUF CAR CHI CIN CLE DAL DEN DET GB HOU IND JAX KC LV LAC LAR MIA MIN NE NO NYG NYJ PHI PIT SEA SF TB TEN WAS'.split())
-        positions=['QB','RB','WR','TE','K','DEF'];shards=[{} for _ in range(16)];core={};pool=[]
-        for pid in c['ordered_ids']:
-            r=tuples[pid];shards[bucket(pid)%16][pid]=r
-            mask=sum(1<<i for i,k in enumerate(positions) if k in (r[2] or []))
-            if mask:
-                assigned=r[3] in teams;pool.append([pid,mask,assigned,r[1]])
-                if assigned:core[pid]=r
-        return put({'schema':1,'encoding':'split-player-tuples-v1','fetched_at':c['fetched_at'],'source_count':c['source_count'],'core':core,'names':put({'schema':1,'index':c['name_index']}),'pool':put({'schema':1,'rows':pool}),'shards':[put({'schema':1,'players':rows}) for rows in shards]})
-    old=previous.get('sleeper',{});old_age=math.inf
-    try: old_age=(datetime.now(timezone.utc)-datetime.fromisoformat(old['fetched_at'].replace('Z','+00:00'))).total_seconds()
-    except (KeyError,ValueError): pass
-    if not args.fixtures and 0<=old_age<86400 and (dest/old['catalog']['path']).exists():
-        cached=json.loads((dest/old['catalog']['path']).read_text())
-        if cached.get('encoding')!='split-player-tuples-v1':
-            manifest['sleeper']={**old,'catalog':put_catalog(cached)}
-        else:
-            manifest['sleeper']=old
-            files.extend([old['catalog']['path'],cached['names']['path'],cached['pool']['path'],*[x['path'] for x in cached['shards']]])
-    else:
-        raw,meta=get(PLAYER_URL,'sleeper.json');catalog=sleeper_catalog(json.loads(raw),meta['retrieved_at'])
-        if not args.fixtures and catalog['source_count']<1000: raise ValueError('Unexpectedly small player directory')
-        if old.get('source_count',0)>catalog['source_count']/0.75: raise ValueError('Player directory shrank by over 25%; refusing silent coverage loss')
-        manifest['sleeper']={'catalog':put_catalog(catalog),'fetched_at':meta['retrieved_at'],'source_count':catalog['source_count'],'url':PLAYER_URL}
     # Keep 48 hours of immutable objects so cached manifests cannot mix generations.
     history=[]
     if (dest/'history.json').exists(): history=json.loads((dest/'history.json').read_text())

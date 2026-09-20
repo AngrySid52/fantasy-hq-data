@@ -33,5 +33,20 @@ class PreparationTests(unittest.TestCase):
     def test_partial_and_empty_weeks(self):
         w=week_file([],2026,2,[],[])
         self.assertEqual(w['rows'],[]);self.assertEqual(w['coverage']['stats_games_seen'],0)
+    def test_halfback_snaps_and_stale_crosswalk_position(self):
+        ids=crosswalk('sleeper_id,gsis_id,pfr_id,name,position\n1,g1,p1,Converted Player,LB\n')
+        self.assertEqual(len(ids),1)
+        snaps=parse_snaps('pfr_player_id,player,season,game_type,week,game_id,position,team,offense_snaps,offense_pct\np1,Converted Player,2026,REG,1,game,HB,CIN,46,0.72\n',2026)
+        self.assertEqual(snaps[0]['position'],'RB')
+        rows=join(ids,[{'name':'Converted Player','gsis_id':'g1','week':1,'game_id':'game','position':'RB','targets':0}],snaps)
+        self.assertEqual(len(rows),1);self.assertEqual(rows[0]['offense_snaps'],46);self.assertEqual(rows[0]['sleeper_id'],'1')
+    def test_external_id_bridges_are_unique_and_never_name_only(self):
+        players=[{'name':'Matthew Example','sleeper_id':None,'gsis_id':'g1','rotowire_id':'77'}, {'name':'Same Exact Name','sleeper_id':None,'gsis_id':'g2'}, {'name':'Ambiguous','sleeper_id':None,'gsis_id':'g3','rotowire_id':'88'}]
+        catalog=sleeper_catalog({'s1':{'full_name':'Matt Example','rotowire_id':77},'s2':{'full_name':'Same Exact Name'},'s3':{'full_name':'Other','rotowire_id':88},'s4':{'full_name':'Other2','rotowire_id':88}},stamp())
+        report=enrich_sleeper_ids(players,catalog['external_index'])
+        self.assertEqual(players[0]['sleeper_id'],'s1');self.assertIsNone(players[1]['sleeper_id']);self.assertIsNone(players[2]['sleeper_id'])
+        self.assertEqual(report['sleeper_ids_added'],1);self.assertEqual(report['ambiguous_candidates_not_joined'],1)
+        conflict=[{'sleeper_id':'existing','rotowire_id':'11'},{'sleeper_id':None,'rotowire_id':'12'}]
+        self.assertEqual(enrich_sleeper_ids(conflict,{'rotowire_id:12':['existing']})['sleeper_ids_added'],0)
 
 if __name__=='__main__': unittest.main()

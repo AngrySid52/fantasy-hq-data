@@ -4,7 +4,9 @@ Public-data inputs for personal fantasy-football analysis:
 - DynastyProcess player-ID crosswalk: https://github.com/dynastyprocess/data
 - Sleeper public NFL player directory and current NFL season: https://docs.sleeper.com/
 
-The directory is fetched at most once per 24 hours when a valid previous output exists. Injuries, player-news article bodies, league records, account credentials, and Odds API data are not published by this job. All player identities are retained, including retired and defensive players. NFL workload uses QB/RB/WR/TE and fullback offensive roles; those roles do not override Sleeper eligibility.
+The directory is fetched at most once per 24 hours when a compatible previous output exists. Upgrading an older snapshot without external-ID indexes requires one initial refresh. Injuries, player-news article bodies, league records, account credentials, and Odds API data are not published by this job. All player identities are retained, including retired and defensive players. NFL workload uses QB/RB/WR/TE plus FB/HB roles normalized to RB; those roles do not override Sleeper eligibility.
+
+The ID crosswalk is not filtered by position, because position designations can lag a role change. Missing Sleeper IDs can be filled through unique shared GSIS, RotoWire, ESPN or Sportradar identifiers present in both public sources. The job records this mapping basis. Ambiguous links, already-claimed IDs and name-only similarities do not produce an automatic join. Missing PFR links remain unresolved.
 
 The source owners retain their applicable data terms. Preparation does not make the sources complete, official, instantaneous or independent of one another. Each publication records retrieval times, source file modification times when supplied, observed game coverage, unavailable components and unresolved identity mappings. Missing values remain null. Generated files are factual data for the private decision workflow, not an endorsement or fantasy recommendation.
 
