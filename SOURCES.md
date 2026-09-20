@@ -11,3 +11,7 @@ The ID crosswalk is not filtered by position, because position designations can 
 The source owners retain their applicable data terms. Preparation does not make the sources complete, official, instantaneous or independent of one another. Each publication records retrieval times, source file modification times when supplied, observed game coverage, unavailable components and unresolved identity mappings. Missing values remain null. Generated files are factual data for the private decision workflow, not an endorsement or fantasy recommendation.
 
 The job runs on demand and approximately every six hours. GitHub schedules can be delayed or disabled after prolonged repository inactivity. Review the Actions page if data freshness fails. The Worker rejects stale manifests rather than reverting to expensive raw downloads.
+
+## v1.3.2 request-cost reduction
+
+Weekly workload objects additionally embed a compact identity lookup for their player IDs and names. Each match is copied from the full global crosswalk, including duplicates or ambiguous matches outside the selected week. Missing keys still use the complete identity shards. This index changes retrieval cost, not player coverage, identity rules, source freshness or missing-data semantics. It is backward compatible with schema 1 readers. No paid data source is introduced.

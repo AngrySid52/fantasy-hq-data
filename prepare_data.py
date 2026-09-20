@@ -132,7 +132,30 @@ def join(players, stats, snaps):
         else: joined[key]={**dict.fromkeys([*METRICS,'opportunities']),**r,'gsis_id':p.get('gsis_id'),'sleeper_id':p.get('sleeper_id'),'stats_present':False,'snaps_present':True}
     return list(joined.values())
 
-def week_file(rows, season, week, stats, snaps):
+def add_week_identities(week, identity_shards):
+    # Copy globally authoritative matches, including ambiguity outside this week.
+    # A week-local unique ID/name alone is not sufficient identity evidence.
+    keys=set(week['by_id'])
+    ni=week['columns'].index('name')
+    keys.update('n:'+norm(r[ni]) for r in week['rows'] if r[ni])
+    for key in list(keys):
+        for p in identity_shards[bucket(key)]['keys'].get(key,[]):
+            if p.get('name'):keys.add('n:'+norm(p['name']))
+    columns=['name','position','sleeper_id','gsis_id','pfr_id','mapping_notes']
+    rows=[]; index={}; seen={}
+    for key in sorted(keys):
+        matches=[]
+        for p in identity_shards[bucket(key)]['keys'].get(key,[]):
+            row=[p.get(k,[] if k=='mapping_notes' else None) for k in columns]
+            packed=encode(row)
+            if packed not in seen:seen[packed]=len(rows);rows.append(row)
+            matches.append(seen[packed])
+        # Do not deduplicate matches: duplicate crosswalk entries remain ambiguous.
+        index[key]=matches
+    week['identity_lookup']={'columns':columns,'rows':rows,'by_key':index}
+    return week
+
+def week_file(rows, season, week, stats, snaps, identity_shards=None):
     selected=[r for r in rows if r['week']==week]
     # Stable sorting and complete rows, including unmapped identities. No player cap.
     selected.sort(key=lambda r:(r['name'] or '',r.get('gsis_id') or r.get('pfr_id') or ''))
@@ -141,7 +164,8 @@ def week_file(rows, season, week, stats, snaps):
         for p,k in [('s','sleeper_id'),('g','gsis_id'),('p','pfr_id')]:
             if r.get(k): by_id.setdefault(p+':'+r[k],[]).append(i)
     orders={k:sorted([i for i,r in enumerate(selected) if r.get(k) is not None],key=lambda i:(-selected[i][k],selected[i]['name'] or '',selected[i].get('gsis_id') or selected[i].get('pfr_id') or '')) for k in SORTS}
-    return {'schema':1,'season':season,'week':week,'columns':COLS,'rows':[[r.get(k) for k in COLS] for r in selected],'by_id':by_id,'orders':orders,'coverage':{'week':week,'stats_games_seen':len({r['game_id'] for r in stats if r['week']==week}),'snap_games_seen':len({r['game_id'] for r in snaps if r['week']==week}),'week_complete_verified':False}}
+    result={'schema':1,'season':season,'week':week,'columns':COLS,'rows':[[r.get(k) for k in COLS] for r in selected],'by_id':by_id,'orders':orders,'coverage':{'week':week,'stats_games_seen':len({r['game_id'] for r in stats if r['week']==week}),'snap_games_seen':len({r['game_id'] for r in snaps if r['week']==week}),'week_complete_verified':False}}
+    return add_week_identities(result,identity_shards) if identity_shards is not None else result
 
 def sleeper_catalog(raw, retrieved):
     if not isinstance(raw,dict) or not raw: raise ValueError('Invalid Sleeper directory')
@@ -172,7 +196,7 @@ def main():
         state,_=fetch('https://api.sleeper.app/v1/state/nfl');season=int(json.loads(state)['season'])
     if not 2025<=season<=datetime.now(timezone.utc).year: raise ValueError('Invalid current season')
     id_text,id_meta=get(ID_URL,'ids.csv');ids=crosswalk(id_text)
-    manifest={'schema':1,'generated_at':now,'current_season':season,'sources':{'ids':id_meta},'identities':[],'preparer_version':'1.3.1','seasons':{},'fixture_data':bool(args.fixtures)}
+    manifest={'schema':1,'generated_at':now,'current_season':season,'sources':{'ids':id_meta},'identities':[],'preparer_version':'1.3.2','seasons':{},'fixture_data':bool(args.fixtures)}
     def put_catalog(c):
         fields=['name','position','fantasy_positions','team','active','status','search_rank','age','years_exp']
         tuples=c['players'] if c.get('encoding')=='player-tuples-v1' else {pid:[p.get(k) for k in fields] for pid,p in c['players'].items()}
@@ -202,7 +226,8 @@ def main():
     external_index=json.loads((dest/catalog_meta['external_ids']['path']).read_text())['index']
     manifest['identity_enrichment']=enrich_sleeper_ids(ids,external_index)
     manifest['sources']['sleeper_identity_links']={'url':PLAYER_URL,'retrieved_at':manifest['sleeper']['fetched_at'],'file_modified_at':None,'status':'AVAILABLE'}
-    manifest['identities']=[put(x) for x in identities(ids)]
+    identity_shards=identities(ids)
+    manifest['identities']=[put(x) for x in identity_shards]
     # Prepare the current and previous season.
     for year in sorted({season,max(2025,season-1)}):
         values={};sources={};warnings=[]
@@ -215,7 +240,7 @@ def main():
         if not values['stats'] and not values['snaps']:
             manifest['seasons'][str(year)]={'status':'UNAVAILABLE','sources':sources,'warnings':warnings};continue
         rows=join(ids,values['stats'],values['snaps'])
-        manifest['seasons'][str(year)]={'status':'AVAILABLE','sources':sources,'warnings':warnings,'weeks':{str(w):put(week_file(rows,year,w,values['stats'],values['snaps'])) for w in range(1,19)}}
+        manifest['seasons'][str(year)]={'status':'AVAILABLE','sources':sources,'warnings':warnings,'weeks':{str(w):put(week_file(rows,year,w,values['stats'],values['snaps'],identity_shards)) for w in range(1,19)}}
     if manifest['seasons'][str(season)]['status']!='AVAILABLE': raise ValueError('Current-season workload unavailable; previous publication retained')
     # Keep 48 hours of immutable objects so cached manifests cannot mix generations.
     history=[]

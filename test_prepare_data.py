@@ -33,6 +33,21 @@ class PreparationTests(unittest.TestCase):
     def test_partial_and_empty_weeks(self):
         w=week_file([],2026,2,[],[])
         self.assertEqual(w['rows'],[]);self.assertEqual(w['coverage']['stats_games_seen'],0)
+    def test_week_identity_index_keeps_global_ambiguity_and_notes(self):
+        ps=[{'name':'Same Name','position':'WR','sleeper_id':'1','gsis_id':'g1','pfr_id':'p1','mapping_notes':['verified provider ID']},
+            {'name':'Same Name','position':'WR','sleeper_id':'2','gsis_id':'g2','pfr_id':'p2'},
+            {'name':'Conflicting ID','position':'TE','sleeper_id':'1','gsis_id':'g3','pfr_id':'p3'}]
+        w={'columns':['name'],'rows':[['Same Name']],'by_id':{'s:1':[0],'g:missing':[0]}}
+        add_week_identities(w,identities(ps));idx=w['identity_lookup']
+        self.assertEqual(len(idx['by_key']['n:samename']),2)
+        self.assertEqual(len(idx['by_key']['s:1']),2)
+        self.assertEqual(idx['by_key']['g:missing'],[])
+        p=dict(zip(idx['columns'],idx['rows'][idx['by_key']['s:1'][0]]))
+        self.assertEqual(p['mapping_notes'],['verified provider ID'])
+        # Even byte-identical crosswalk duplicates remain ambiguous.
+        w2={'columns':['name'],'rows':[['Same Name']],'by_id':{'s:1':[0]}}
+        add_week_identities(w2,identities([ps[0],ps[0]]))
+        self.assertEqual(len(w2['identity_lookup']['by_key']['s:1']),2)
     def test_halfback_snaps_and_stale_crosswalk_position(self):
         ids=crosswalk('sleeper_id,gsis_id,pfr_id,name,position\n1,g1,p1,Converted Player,LB\n')
         self.assertEqual(len(ids),1)
