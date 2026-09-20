@@ -1,0 +1,36 @@
+name: Refresh Fantasy HQ public data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fantasy-hq-public-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the main branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+      - name: Test data preparation
+        run: python3 -m unittest -v test_prepare_data.py
+      - name: Prepare public NFL data
+        run: python3 prepare_data.py
+      - name: Publish validated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if ! git diff --cached --quiet; then
+            git commit -m "Refresh public NFL data"
+            git push origin HEAD:main
+          fi
